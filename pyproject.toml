@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "quant-trading-system"
-version = "0.1.0"
+version = "0.3.0"
 description = "A股量化交易系统 - 支持可插拔数据源、多策略回测、风险管理"
 readme = "README.md"
 license = {text = "MIT"}
