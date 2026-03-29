@@ -13,10 +13,11 @@
 """
 
 from quant_trading.data.base import DataSource, DataSourceRegistry
+from quant_trading.data.export import DataExporter
 from quant_trading.data.manager import DataManager
 
 # 导入具体数据源，触发 @DataSourceRegistry.register() 装饰器注册
 import quant_trading.data.akshare_source as _akshare_source  # noqa: F401
 import quant_trading.data.tushare_source as _tushare_source  # noqa: F401
 
-__all__ = ["DataSource", "DataSourceRegistry", "DataManager"]
+__all__ = ["DataSource", "DataSourceRegistry", "DataExporter", "DataManager"]

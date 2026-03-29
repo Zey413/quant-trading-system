@@ -1,10 +1,12 @@
 """命令行工具 - 基于Click的量化交易系统CLI
 
 提供以下子命令:
-- fetch:      获取股票行情数据
-- backtest:   运行策略回测
-- strategies: 列出所有可用策略
-- plot:       生成可视化图表
+- fetch:       获取股票行情数据
+- backtest:    运行策略回测
+- strategies:  列出所有可用策略
+- plot:        生成可视化图表
+- optimize:    运行策略参数优化
+- report:      生成回测报告
 
 使用Rich美化终端输出。
 """
@@ -563,6 +565,303 @@ def _split_save_path(save_path: str) -> tuple[str, str]:
     if not ext:
         ext = '.png'
     return base, ext
+
+
+# ------------------------------------------------------------------ #
+#  optimize - 策略参数优化
+# ------------------------------------------------------------------ #
+
+@cli.command()
+@click.option('--strategy', '-st', required=True, help='策略名称 (如: ma_crossover)')
+@click.option('--symbol', '-s', required=True, help='股票代码 (如: 000001)')
+@click.option('--start', default=None, help='开始日期 (默认使用配置)')
+@click.option('--end', default=None, help='结束日期 (默认使用配置)')
+@click.option(
+    '--params', '-p', required=True,
+    help='参数网格JSON (如: \'{"short_window":[3,5,10],"long_window":[15,20,30]}\')',
+)
+@click.option(
+    '--metric', '-m', default='sharpe_ratio',
+    help='优化指标 (默认: sharpe_ratio)',
+)
+@click.pass_context
+def optimize(ctx: click.Context, strategy: str, symbol: str,
+             start: str | None, end: str | None, params: str,
+             metric: str) -> None:
+    """运行策略参数优化
+
+    \b
+    使用网格搜索在参数空间中寻找使指定指标最优的参数组合。
+
+    \b
+    示例:
+      quant optimize -st ma_crossover -s 000001 -p '{"short_window":[3,5,10],"long_window":[15,20,30]}'
+      quant optimize -st rsi -s 600519 -p '{"rsi_period":[10,14,20]}' -m total_return
+    """
+    import json
+
+    config = ctx.obj['config']
+
+    # 覆盖日期
+    if start:
+        config.backtest.start_date = start
+    if end:
+        config.backtest.end_date = end
+
+    # 解析参数网格
+    try:
+        param_grid = json.loads(params)
+    except json.JSONDecodeError as e:
+        console.print(f"[bold red]错误:[/] 参数JSON解析失败: {e}")
+        sys.exit(1)
+
+    if not isinstance(param_grid, dict) or not param_grid:
+        console.print("[bold red]错误:[/] 参数网格必须是非空的JSON对象")
+        sys.exit(1)
+
+    # 导入依赖模块
+    try:
+        from quant_trading.data.manager import DataManager
+        from quant_trading.backtest.optimizer import GridSearchOptimizer
+        import quant_trading.strategy  # noqa: F401 — 触发策略注册
+    except ImportError as e:
+        console.print(f"[bold red]错误:[/] 无法导入模块: {e}")
+        sys.exit(1)
+
+    # 计算参数组合数
+    from itertools import product
+    combo_count = 1
+    for v in param_grid.values():
+        combo_count *= len(v)
+
+    console.print(Panel(
+        f"[bold]策略:[/] {strategy}  |  "
+        f"[bold]股票:[/] {symbol}  |  "
+        f"[bold]指标:[/] {metric}  |  "
+        f"[bold]组合数:[/] {combo_count}",
+        title="[bold cyan]参数优化[/]",
+        border_style="cyan",
+    ))
+
+    # 获取数据
+    console.print("\n[dim]正在获取行情数据...[/]")
+    dm = DataManager(config)
+    try:
+        data = dm.fetch_daily(symbol, config.backtest.start_date, config.backtest.end_date)
+    except Exception as e:
+        console.print(f"[bold red]获取数据失败:[/] {e}")
+        sys.exit(1)
+
+    if data.empty:
+        console.print("[yellow]未获取到数据，请检查股票代码和日期范围。[/]")
+        return
+
+    console.print(f"[dim]获取到 {len(data)} 条行情数据[/]")
+
+    # 运行优化
+    console.print(f"[dim]正在执行网格搜索 ({combo_count} 种参数组合)...[/]")
+    optimizer = GridSearchOptimizer(config)
+
+    try:
+        result = optimizer.optimize(
+            strategy_name=strategy,
+            param_grid=param_grid,
+            data=data,
+            symbol=symbol,
+            metric=metric,
+        )
+    except (KeyError, ValueError) as e:
+        console.print(f"[bold red]优化失败:[/] {e}")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[bold red]优化执行失败:[/] {e}")
+        logger.exception("优化执行失败")
+        sys.exit(1)
+
+    # 展示结果
+    if result.all_results.empty:
+        console.print("[yellow]所有参数组合均失败，无有效结果。[/]")
+        return
+
+    # 最优参数
+    console.print(Panel(
+        f"[bold green]最优参数:[/] {result.best_params}\n"
+        f"[bold]{metric}:[/] {result.best_metric_value:.6f}",
+        title="[bold green]优化结果[/]",
+        border_style="green",
+    ))
+
+    # 结果表格
+    results_table = Table(
+        title="全部参数组合结果",
+        box=box.ROUNDED,
+        show_header=True,
+        header_style="bold cyan",
+    )
+    for col in result.all_results.columns:
+        results_table.add_column(col, justify="right")
+
+    for _, row in result.all_results.iterrows():
+        values = []
+        for col in result.all_results.columns:
+            val = row[col]
+            if isinstance(val, float):
+                values.append(f"{val:.6f}")
+            else:
+                values.append(str(val))
+        results_table.add_row(*values)
+
+    console.print(results_table)
+
+
+# ------------------------------------------------------------------ #
+#  report - 生成回测报告
+# ------------------------------------------------------------------ #
+
+@cli.command()
+@click.option('--strategy', '-st', required=True, help='策略名称 (如: ma_crossover)')
+@click.option('--symbol', '-s', required=True, help='股票代码 (如: 000001)')
+@click.option('--start', default=None, help='开始日期 (默认使用配置)')
+@click.option('--end', default=None, help='结束日期 (默认使用配置)')
+@click.option(
+    '--format', '-f', 'output_format',
+    type=click.Choice(['text', 'csv'], case_sensitive=False),
+    default='text',
+    help='输出格式 (默认: text)',
+)
+@click.option(
+    '--output', '-o', default='reports',
+    help='输出目录 (默认: reports)',
+)
+@click.pass_context
+def report(ctx: click.Context, strategy: str, symbol: str,
+           start: str | None, end: str | None, output_format: str,
+           output: str) -> None:
+    """生成回测报告
+
+    \b
+    运行回测并生成完整报告，支持文本和CSV格式。
+
+    \b
+    示例:
+      quant report -st ma_crossover -s 000001
+      quant report -st rsi -s 600519 -f csv -o ./output
+      quant report -st macd -s 000001 --start 2023-01-01 --end 2024-12-31
+    """
+    import os
+
+    config = ctx.obj['config']
+
+    # 覆盖日期
+    start_date = start or config.backtest.start_date
+    end_date = end or config.backtest.end_date
+    if start:
+        config.backtest.start_date = start
+    if end:
+        config.backtest.end_date = end
+
+    # 导入依赖模块
+    try:
+        from quant_trading.data.manager import DataManager
+        from quant_trading.strategy import StrategyRegistry
+        from quant_trading.backtest.engine import BacktestEngine
+        from quant_trading.backtest.report import ReportGenerator
+    except ImportError as e:
+        console.print(f"[bold red]错误:[/] 无法导入模块: {e}")
+        sys.exit(1)
+
+    # 获取策略
+    try:
+        strategy_instance = StrategyRegistry.get(strategy)
+    except (KeyError, ValueError) as e:
+        console.print(f"[bold red]错误:[/] {e}")
+        console.print(f"[dim]可用策略: {', '.join(StrategyRegistry.list_strategies())}[/]")
+        sys.exit(1)
+
+    console.print(Panel(
+        f"[bold]策略:[/] {strategy}  |  "
+        f"[bold]股票:[/] {symbol}  |  "
+        f"[bold]日期:[/] {start_date} ~ {end_date}  |  "
+        f"[bold]格式:[/] {output_format}",
+        title="[bold cyan]生成报告[/]",
+        border_style="cyan",
+    ))
+
+    # 获取数据
+    console.print("\n[dim]正在获取行情数据...[/]")
+    dm = DataManager(config)
+    try:
+        data = dm.fetch_daily(symbol, start_date, end_date)
+    except Exception as e:
+        console.print(f"[bold red]获取数据失败:[/] {e}")
+        sys.exit(1)
+
+    if data.empty:
+        console.print("[yellow]未获取到数据，请检查股票代码和日期范围。[/]")
+        return
+
+    console.print(f"[dim]获取到 {len(data)} 条行情数据[/]")
+
+    # 运行回测
+    console.print("[dim]正在运行回测...[/]")
+    engine = BacktestEngine(config)
+
+    try:
+        result = engine.run(strategy_instance, data, symbol=symbol)
+    except Exception as e:
+        console.print(f"[bold red]回测执行失败:[/] {e}")
+        logger.exception("回测执行失败")
+        sys.exit(1)
+
+    # 创建输出目录
+    os.makedirs(output, exist_ok=True)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    base_name = f"{symbol}_{strategy}_{timestamp}"
+
+    if output_format == 'text':
+        # 生成文本报告
+        text_report = ReportGenerator.generate_text_report(
+            result=result,
+            strategy_name=strategy,
+            symbol=symbol,
+            config=config,
+            trades=engine.trades,
+        )
+
+        report_path = os.path.join(output, f"{base_name}_report.txt")
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write(text_report)
+
+        console.print(f"\n[bold green]文本报告已保存至:[/] {report_path}")
+
+        # 同时在终端显示摘要
+        _display_backtest_result(result, strategy, symbol)
+
+    elif output_format == 'csv':
+        # 导出交易记录CSV
+        trades_path = os.path.join(output, f"{base_name}_trades.csv")
+        ReportGenerator.generate_csv_trades(engine.trades, trades_path)
+        console.print(f"[bold green]交易记录已保存至:[/] {trades_path}")
+
+        # 导出净值曲线CSV
+        equity_path = os.path.join(output, f"{base_name}_equity.csv")
+        ReportGenerator.generate_equity_csv(result.equity_curve, equity_path)
+        console.print(f"[bold green]净值曲线已保存至:[/] {equity_path}")
+
+        # 同时生成文本报告
+        text_report = ReportGenerator.generate_text_report(
+            result=result,
+            strategy_name=strategy,
+            symbol=symbol,
+            config=config,
+            trades=engine.trades,
+        )
+        report_path = os.path.join(output, f"{base_name}_report.txt")
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write(text_report)
+        console.print(f"[bold green]文本报告已保存至:[/] {report_path}")
+
+    console.print("\n[bold green]报告生成完成![/]")
 
 
 # ------------------------------------------------------------------ #
