@@ -1,7 +1,11 @@
 """策略回测 - 策略选择、参数配置、一键回测、结果展示、多策略对比
 
-支持选择已注册策略并动态生成参数表单，结果包含净值曲线、回撤图、
-月度热力图、绩效指标面板、交易明细。
+支持两种回测模式:
+1. 真实回测: 使用 BacktestEngine + StrategyRegistry + DataManager（需要网络/数据）
+2. 模拟回测: 使用模拟数据生成结果（无外部依赖，确保可运行）
+
+结果包含净值曲线、回撤图、月度热力图、绩效指标面板、
+收益分布、滚动指标、交易明细。
 """
 
 from __future__ import annotations
@@ -16,8 +20,15 @@ from quant_trading.web.charts import (
     drawdown_chart,
     equity_curve,
     monthly_returns_heatmap,
+    returns_distribution,
+    rolling_metrics_chart,
 )
-from quant_trading.web.components import metric_card, performance_table, trade_table
+from quant_trading.web.components import (
+    metric_card,
+    performance_table,
+    trade_table,
+    info_box,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -89,18 +100,120 @@ STRATEGY_PARAMS: dict[str, dict] = {
 
 
 # ---------------------------------------------------------------------------
+# 真实回测（使用引擎 + 策略注册表 + 数据管理器）
+# ---------------------------------------------------------------------------
+
+def _run_real_backtest(
+    strategy_name: str,
+    params: dict,
+    stock_code: str,
+    start_date: str,
+    end_date: str,
+    initial_capital: float,
+) -> dict | None:
+    """尝试使用真实回测引擎运行回测
+
+    Returns None 表示无法使用真实引擎（缺少数据或模块异常）。
+    """
+    try:
+        from quant_trading.core.config import AppConfig
+        from quant_trading.backtest import BacktestEngine
+        from quant_trading.strategy import StrategyRegistry
+        from quant_trading.data import DataManager
+
+        # 构建配置
+        config = AppConfig()
+        config.backtest.initial_capital = initial_capital
+        config.backtest.start_date = start_date
+        config.backtest.end_date = end_date
+
+        # 获取策略实例
+        strategy = StrategyRegistry.get(strategy_name, **params)
+
+        # 获取数据
+        dm = DataManager(config)
+        df = dm.fetch_daily(stock_code, start_date, end_date)
+        if df.empty or len(df) < 30:
+            return None
+
+        # 运行回测
+        engine = BacktestEngine(config)
+        result = engine.run(strategy, df, stock_code)
+
+        if result.equity_curve.empty:
+            return None
+
+        # 转换为页面所需格式
+        total_return = result.total_return
+        ann_return = result.annualized_return
+        max_dd = result.max_drawdown
+        sharpe = result.sharpe_ratio
+
+        # 构建交易记录 DataFrame
+        trades_list = []
+        for t in engine.trades:
+            trades_list.append({
+                "日期": str(t.date),
+                "代码": t.symbol,
+                "方向": "卖出" if t.side == "sell" else "买入",
+                "数量": t.quantity,
+                "价格": round(t.price, 2),
+                "佣金": round(t.commission, 2),
+                "印花税": round(t.tax, 2),
+                "盈亏": round(t.pnl, 2),
+            })
+        trades_df = pd.DataFrame(trades_list) if trades_list else pd.DataFrame()
+
+        return {
+            "strategy_name": strategy_name,
+            "params": params,
+            "stock_code": stock_code,
+            "equity_series": result.equity_curve,
+            "benchmark_series": pd.Series(dtype=float),  # 基准暂不获取
+            "drawdown_series": result.drawdown_series,
+            "trades_df": trades_df,
+            "metrics": {
+                "总收益率": f"{total_return:.2%}",
+                "年化收益率": f"{ann_return:.2%}",
+                "年化波动率": f"{result.volatility:.2%}",
+                "最大回撤": f"{max_dd:.2%}",
+                "最大回撤持续天数": f"{result.max_drawdown_duration}",
+                "夏普比率": round(sharpe, 4),
+                "Sortino比率": round(result.sortino_ratio, 4),
+                "Calmar比率": round(result.calmar_ratio, 4),
+                "总交易次数": result.total_trades,
+                "胜率": f"{result.win_rate:.2%}",
+                "盈亏比": round(result.profit_loss_ratio, 4),
+                "平均盈利": round(result.avg_win, 2),
+                "平均亏损": round(result.avg_loss, 2),
+            },
+            "summary_values": {
+                "total_return": total_return,
+                "ann_return": ann_return,
+                "max_dd": max_dd,
+                "sharpe": sharpe,
+            },
+            "mode": "real",
+        }
+    except Exception as e:
+        st.warning(f"真实回测引擎不可用 ({e!r})，将使用模拟模式。")
+        return None
+
+
+# ---------------------------------------------------------------------------
 # 模拟回测结果
 # ---------------------------------------------------------------------------
 
 def _simulate_backtest(
     strategy_name: str,
     params: dict,
+    stock_code: str,
     start_date: str,
     end_date: str,
     initial_capital: float,
 ) -> dict:
     """模拟生成回测结果（不依赖真实数据源）"""
-    np.random.seed(hash(strategy_name + str(params)) % 2**31)
+    np.random.seed(hash(strategy_name + str(params) + stock_code) % 2**31)
 
     start = pd.Timestamp(start_date)
     end = pd.Timestamp(end_date)
@@ -112,22 +225,14 @@ def _simulate_backtest(
 
     # 根据策略特征生成不同的收益分布
     volatility_map = {
-        "ma_crossover": 0.015,
-        "rsi": 0.018,
-        "macd": 0.014,
-        "bollinger": 0.016,
-        "dual_thrust": 0.020,
-        "mean_reversion": 0.012,
-        "turtle": 0.022,
+        "ma_crossover": 0.015, "rsi": 0.018, "macd": 0.014,
+        "bollinger": 0.016, "dual_thrust": 0.020,
+        "mean_reversion": 0.012, "turtle": 0.022,
     }
     drift_map = {
-        "ma_crossover": 0.0004,
-        "rsi": 0.0003,
-        "macd": 0.0005,
-        "bollinger": 0.0002,
-        "dual_thrust": 0.0006,
-        "mean_reversion": 0.0003,
-        "turtle": 0.0004,
+        "ma_crossover": 0.0004, "rsi": 0.0003, "macd": 0.0005,
+        "bollinger": 0.0002, "dual_thrust": 0.0006,
+        "mean_reversion": 0.0003, "turtle": 0.0004,
     }
     vol = volatility_map.get(strategy_name, 0.015)
     drift = drift_map.get(strategy_name, 0.0003)
@@ -155,13 +260,14 @@ def _simulate_backtest(
 
     # 模拟交易记录
     n_trades = np.random.randint(20, 80)
-    trade_dates = np.random.choice(dates, size=n_trades * 2, replace=True)
+    trade_dates = np.random.choice(dates, size=min(n_trades * 2, len(dates)), replace=True)
     trade_dates.sort()
     stocks = ["600519", "000858", "601318", "600036", "000001", "300750"]
     stock_names = ["贵州茅台", "五粮液", "中国平安", "招商银行", "平安银行", "宁德时代"]
 
     trades_list = []
-    for i in range(n_trades):
+    actual_trades = min(n_trades, len(trade_dates) // 2)
+    for i in range(actual_trades):
         idx = np.random.randint(0, len(stocks))
         pnl = np.random.normal(2000, 8000)
         buy_price = np.random.uniform(10, 200)
@@ -169,7 +275,7 @@ def _simulate_backtest(
         qty = np.random.choice([100, 200, 300, 500, 1000])
 
         buy_date = trade_dates[i * 2]
-        sell_date = trade_dates[i * 2 + 1]
+        sell_date = trade_dates[min(i * 2 + 1, len(trade_dates) - 1)]
         if sell_date <= buy_date:
             sell_date = buy_date + pd.Timedelta(days=np.random.randint(1, 30))
 
@@ -188,7 +294,7 @@ def _simulate_backtest(
     trades_df = pd.DataFrame(trades_list)
     wins = [t for t in trades_list if t["盈亏"] > 0]
     losses = [t for t in trades_list if t["盈亏"] < 0]
-    win_rate = len(wins) / n_trades if n_trades > 0 else 0
+    win_rate = len(wins) / actual_trades if actual_trades > 0 else 0
     avg_win = float(np.mean([w["盈亏"] for w in wins])) if wins else 0
     avg_loss = float(np.mean([l["盈亏"] for l in losses])) if losses else 0
     pl_ratio = abs(avg_win / avg_loss) if avg_loss != 0 else 0
@@ -211,6 +317,7 @@ def _simulate_backtest(
     return {
         "strategy_name": strategy_name,
         "params": params,
+        "stock_code": stock_code,
         "equity_series": equity_series,
         "benchmark_series": benchmark_series,
         "drawdown_series": drawdown_series,
@@ -224,7 +331,7 @@ def _simulate_backtest(
             "夏普比率": round(sharpe, 4),
             "Sortino比率": round(sortino, 4),
             "Calmar比率": round(calmar, 4),
-            "总交易次数": n_trades,
+            "总交易次数": actual_trades,
             "胜率": f"{win_rate:.2%}",
             "盈亏比": round(pl_ratio, 4),
             "平均盈利": round(avg_win, 2),
@@ -236,6 +343,7 @@ def _simulate_backtest(
             "max_dd": max_dd,
             "sharpe": sharpe,
         },
+        "mode": "simulated",
     }
 
 
@@ -293,6 +401,19 @@ def render() -> None:
 
             st.markdown("---")
 
+            # 股票选择
+            from quant_trading.web.components import STOCK_POOL
+            stock_options = list(STOCK_POOL.keys())
+            stock_code = st.selectbox(
+                "选择股票",
+                stock_options,
+                format_func=lambda x: f"{x} {STOCK_POOL.get(x, '')}",
+                index=stock_options.index("600519") if "600519" in stock_options else 0,
+                key="bt_stock",
+            )
+
+            st.markdown("---")
+
             # 回测参数
             start_date = st.date_input("开始日期", value=pd.Timestamp("2023-01-01"))
             end_date = st.date_input("结束日期", value=pd.Timestamp("2025-12-31"))
@@ -307,22 +428,53 @@ def render() -> None:
 
             st.markdown("---")
 
+            # 回测模式
+            use_real = st.checkbox(
+                "尝试使用真实回测引擎",
+                value=False,
+                help="启用后将使用 BacktestEngine + DataManager 进行真实回测，"
+                     "需要数据源可用。否则使用模拟数据。",
+            )
+
             run_btn = st.button("🚀 一键回测", type="primary", use_container_width=True)
 
         with col_result:
             if run_btn:
                 with st.spinner("正在运行回测..."):
-                    result = _simulate_backtest(
-                        strategy_key,
-                        user_params,
-                        start_date.strftime("%Y-%m-%d"),
-                        end_date.strftime("%Y-%m-%d"),
-                        initial_capital,
-                    )
+                    result = None
+
+                    # 尝试真实回测
+                    if use_real:
+                        result = _run_real_backtest(
+                            strategy_key,
+                            user_params,
+                            stock_code,
+                            start_date.strftime("%Y-%m-%d"),
+                            end_date.strftime("%Y-%m-%d"),
+                            initial_capital,
+                        )
+
+                    # 回退到模拟
+                    if result is None:
+                        result = _simulate_backtest(
+                            strategy_key,
+                            user_params,
+                            stock_code,
+                            start_date.strftime("%Y-%m-%d"),
+                            end_date.strftime("%Y-%m-%d"),
+                            initial_capital,
+                        )
 
                 if not result:
                     st.error("回测失败：日期范围过短，请调整参数")
                 else:
+                    # 显示回测模式
+                    mode = result.get("mode", "simulated")
+                    if mode == "real":
+                        st.success("✅ 使用真实回测引擎完成")
+                    else:
+                        st.info("📊 使用模拟数据完成（启用真实引擎可获取实际结果）")
+
                     st.session_state.backtest_results[strategy_key] = result
                     _render_result(result)
 
@@ -363,9 +515,11 @@ def _render_result(result: dict) -> None:
 
     # 净值曲线
     st.subheader("📈 净值曲线")
+    bm = result.get("benchmark_series")
+    bm_arg = bm if bm is not None and not bm.empty else None
     fig_eq = equity_curve(
         result["equity_series"],
-        result["benchmark_series"],
+        bm_arg,
         title="",
     )
     st.plotly_chart(fig_eq, use_container_width=True)
@@ -380,14 +534,38 @@ def _render_result(result: dict) -> None:
         st.subheader("📋 绩效指标")
         performance_table(result["metrics"])
 
-    # 月度热力图
-    st.subheader("🗓️ 月度收益热力图")
-    fig_hm = monthly_returns_heatmap(result["equity_series"], title="")
-    st.plotly_chart(fig_hm, use_container_width=True)
+    # 月度热力图 + 收益分布
+    col_hm, col_dist = st.columns([2, 1])
+    with col_hm:
+        st.subheader("🗓️ 月度收益热力图")
+        fig_hm = monthly_returns_heatmap(result["equity_series"], title="")
+        st.plotly_chart(fig_hm, use_container_width=True)
+
+    with col_dist:
+        st.subheader("📊 收益分布")
+        daily_ret = result["equity_series"].pct_change().dropna()
+        fig_dist = returns_distribution(daily_ret, title="", bins=40)
+        fig_dist.update_layout(height=300)
+        st.plotly_chart(fig_dist, use_container_width=True)
+
+    # 滚动指标
+    with st.expander("📈 滚动指标分析", expanded=False):
+        window = st.select_slider(
+            "滚动窗口",
+            options=[20, 40, 60, 120],
+            value=60,
+            key="roll_window",
+        )
+        fig_roll = rolling_metrics_chart(result["equity_series"], window=window, title="")
+        st.plotly_chart(fig_roll, use_container_width=True)
 
     # 交易明细
     st.subheader("📝 交易明细")
-    trade_table(result["trades_df"])
+    trades_df = result.get("trades_df", pd.DataFrame())
+    if not trades_df.empty:
+        trade_table(trades_df)
+    else:
+        st.info("无交易记录")
 
 
 def _render_comparison() -> None:
@@ -397,13 +575,20 @@ def _render_comparison() -> None:
     if len(results) < 2:
         st.info("请先在「单策略回测」标签页中至少运行两个不同策略的回测，然后回到此处进行对比。")
         st.caption(f"当前已回测策略: {', '.join(results.keys()) if results else '无'}")
+
+        if results:
+            st.markdown("---")
+            for name, res in results.items():
+                display_name = STRATEGY_PARAMS.get(name, {}).get("display_name", name)
+                sv = res["summary_values"]
+                st.markdown(f"- **{display_name}**: 收益 {sv['total_return']:.2%} | 夏普 {sv['sharpe']:.4f}")
         return
 
     st.subheader("📈 策略净值对比")
     import plotly.graph_objects as go
 
     fig = go.Figure()
-    for name, res in results.items():
+    for i, (name, res) in enumerate(results.items()):
         display_name = STRATEGY_PARAMS.get(name, {}).get("display_name", name)
         eq = res["equity_series"]
         norm = eq / eq.iloc[0]
@@ -450,3 +635,32 @@ def _render_comparison() -> None:
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
     st.plotly_chart(fig_dd, use_container_width=True)
+
+    # 策略摘要排名
+    st.subheader("🏆 策略排名")
+    rank_data = []
+    for name, res in results.items():
+        display_name = STRATEGY_PARAMS.get(name, {}).get("display_name", name)
+        sv = res["summary_values"]
+        rank_data.append({
+            "策略": display_name,
+            "总收益率": sv["total_return"],
+            "年化收益率": sv["ann_return"],
+            "最大回撤": sv["max_dd"],
+            "夏普比率": sv["sharpe"],
+        })
+    rank_df = pd.DataFrame(rank_data)
+    rank_df = rank_df.sort_values("夏普比率", ascending=False).reset_index(drop=True)
+    rank_df.index = rank_df.index + 1
+    rank_df.index.name = "排名"
+
+    st.dataframe(
+        rank_df,
+        use_container_width=True,
+        column_config={
+            "总收益率": st.column_config.NumberColumn("总收益率", format="%.2%%"),
+            "年化收益率": st.column_config.NumberColumn("年化收益率", format="%.2%%"),
+            "最大回撤": st.column_config.NumberColumn("最大回撤", format="%.2%%"),
+            "夏普比率": st.column_config.NumberColumn("夏普比率", format="%.4f"),
+        },
+    )

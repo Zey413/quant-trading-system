@@ -42,6 +42,15 @@ _DEFAULT_STATE: dict = {
         "risk_free_rate": 0.025,
         "data_source": "akshare",
     },
+    # 风控规则
+    "risk_rules": {
+        "max_position_pct": 30,
+        "max_total_position_pct": 80,
+        "stop_loss_pct": 5,
+        "take_profit_pct": 15,
+        "max_drawdown_limit": 15,
+        "var_limit": 50000.0,
+    },
 }
 
 
@@ -94,6 +103,15 @@ def _render_sidebar() -> str:
                 st.rerun()
 
         st.markdown("---")
+
+        # 快捷信息面板
+        settings = st.session_state.settings
+        st.markdown("**快捷信息**")
+        st.caption(f"初始资金: ¥{settings['initial_capital']:,.0f}")
+        st.caption(f"数据源: {settings['data_source']}")
+        st.caption(f"自选股: {len(st.session_state.watchlist)} 只")
+
+        st.markdown("---")
         st.caption("v0.3.0  |  A股量化交易系统")
 
     return st.session_state.current_page
@@ -141,6 +159,7 @@ def _inject_css() -> None:
         color: white;
         text-align: center;
         box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+        margin-bottom: 10px;
     }
     .metric-card .value { font-size: 28px; font-weight: bold; }
     .metric-card .label { font-size: 14px; opacity: 0.85; margin-top: 5px; }
@@ -150,6 +169,22 @@ def _inject_css() -> None:
     /* 红涨绿跌（A股配色） */
     .price-up { color: #ff4444; }
     .price-down { color: #00c851; }
+    /* 表格优化 */
+    .stDataFrame { border-radius: 8px; }
+    /* 标签页美化 */
+    .stTabs [data-baseweb="tab-list"] { gap: 8px; }
+    .stTabs [data-baseweb="tab"] {
+        border-radius: 8px 8px 0 0;
+        padding: 8px 16px;
+    }
+    /* 信息框 */
+    .info-box {
+        background: #f0f2f6;
+        border-left: 4px solid #4169E1;
+        padding: 12px 16px;
+        border-radius: 0 8px 8px 0;
+        margin: 8px 0;
+    }
     </style>
     """, unsafe_allow_html=True)
 

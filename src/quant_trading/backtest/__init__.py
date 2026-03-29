@@ -1,5 +1,6 @@
 """回测引擎模块"""
 
+from quant_trading.backtest.benchmark import BenchmarkManager, BenchmarkResult
 from quant_trading.backtest.broker import SimulatedBroker
 from quant_trading.backtest.comparator import ComparisonResult, StrategyComparator
 from quant_trading.backtest.engine import BacktestEngine
@@ -20,6 +21,8 @@ from quant_trading.backtest.walk_forward import (
 
 __all__ = [
     "BacktestEngine",
+    "BenchmarkManager",
+    "BenchmarkResult",
     "ComparisonResult",
     "GridSearchOptimizer",
     "OptimizationResult",

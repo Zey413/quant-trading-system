@@ -20,17 +20,190 @@ from quant_trading.core.models import Order, Portfolio
 logger = logging.getLogger(__name__)
 
 
+class PriceLimitChecker:
+    """涨跌停限制校验器
+
+    A股涨跌停规则：
+    - 普通股票（主板）: ±10%
+    - ST / *ST 股票: ±5%
+    - 科创板（688xxx）/ 创业板（30xxxx）: ±20%
+    - 北交所（8xxxxx / 4xxxxx）: ±30%
+
+    Attributes:
+        enabled: 是否启用涨跌停校验
+    """
+
+    # 涨跌停幅度映射
+    LIMIT_RATIOS: dict[str, float] = {
+        "normal": 0.10,     # 主板普通股票 ±10%
+        "st": 0.05,         # ST股票 ±5%
+        "star": 0.20,       # 科创板 ±20%
+        "gem": 0.20,        # 创业板 ±20%
+        "bse": 0.30,        # 北交所 ±30%
+    }
+
+    def __init__(self, enabled: bool = True) -> None:
+        self.enabled = enabled
+
+    def get_board_type(self, symbol: str, is_st: bool = False) -> str:
+        """根据股票代码判断板块类型
+
+        Args:
+            symbol: 股票代码 (如 "000001", "688001", "300750")
+            is_st: 是否为ST股票
+
+        Returns:
+            板块类型字符串
+        """
+        if is_st:
+            return "st"
+        code = symbol.replace(".", "").strip()
+        # 取纯数字部分
+        digits = "".join(c for c in code if c.isdigit())
+        if digits.startswith("688"):
+            return "star"
+        elif digits.startswith("30"):
+            return "gem"
+        elif digits.startswith("8") or digits.startswith("4"):
+            return "bse"
+        else:
+            return "normal"
+
+    def get_limit_ratio(self, symbol: str, is_st: bool = False) -> float:
+        """获取涨跌停幅度
+
+        Args:
+            symbol: 股票代码
+            is_st: 是否为ST股票
+
+        Returns:
+            涨跌停幅度（如0.10表示±10%）
+        """
+        board_type = self.get_board_type(symbol, is_st)
+        return self.LIMIT_RATIOS.get(board_type, 0.10)
+
+    def check(
+        self,
+        symbol: str,
+        current_price: float,
+        prev_close: float,
+        is_st: bool = False,
+    ) -> tuple[bool, bool, float, float]:
+        """检查涨跌停状态
+
+        Args:
+            symbol: 股票代码
+            current_price: 当前价格
+            prev_close: 前一交易日收盘价
+            is_st: 是否为ST股票
+
+        Returns:
+            (at_upper_limit, at_lower_limit, upper_price, lower_price)
+        """
+        if not self.enabled or prev_close <= 0:
+            return False, False, 0.0, 0.0
+
+        ratio = self.get_limit_ratio(symbol, is_st)
+        upper_price = round(prev_close * (1 + ratio), 2)
+        lower_price = round(prev_close * (1 - ratio), 2)
+
+        at_upper = current_price >= upper_price
+        at_lower = current_price <= lower_price
+
+        return at_upper, at_lower, upper_price, lower_price
+
+    def can_buy(
+        self,
+        symbol: str,
+        current_price: float,
+        prev_close: float,
+        is_st: bool = False,
+    ) -> tuple[bool, str]:
+        """检查是否可以买入（涨停不可买入）
+
+        Args:
+            symbol: 股票代码
+            current_price: 当前价格
+            prev_close: 前一交易日收盘价
+            is_st: 是否为ST股票
+
+        Returns:
+            (can_buy, reason)
+        """
+        if not self.enabled:
+            return True, ""
+
+        at_upper, _, upper_price, _ = self.check(
+            symbol, current_price, prev_close, is_st
+        )
+        if at_upper:
+            return (
+                False,
+                f"{symbol} 涨停（当前 {current_price:.2f} >= 涨停价 {upper_price:.2f}），不可买入",
+            )
+        return True, ""
+
+    def can_sell(
+        self,
+        symbol: str,
+        current_price: float,
+        prev_close: float,
+        is_st: bool = False,
+    ) -> tuple[bool, str]:
+        """检查是否可以卖出（跌停不可卖出）
+
+        Args:
+            symbol: 股票代码
+            current_price: 当前价格
+            prev_close: 前一交易日收盘价
+            is_st: 是否为ST股票
+
+        Returns:
+            (can_sell, reason)
+        """
+        if not self.enabled:
+            return True, ""
+
+        _, at_lower, _, lower_price = self.check(
+            symbol, current_price, prev_close, is_st
+        )
+        if at_lower:
+            return (
+                False,
+                f"{symbol} 跌停（当前 {current_price:.2f} <= 跌停价 {lower_price:.2f}），不可卖出",
+            )
+        return True, ""
+
+
 class SimulatedBroker:
     """模拟券商
 
     基于A股市场规则模拟订单执行，计算佣金、印花税和滑点。
+    支持涨跌停限制校验。
 
     Attributes:
         config: 券商配置（佣金率、印花税率、滑点等）
+        price_limit_checker: 涨跌停校验器
     """
 
-    def __init__(self, config: BrokerConfig) -> None:
+    def __init__(
+        self,
+        config: BrokerConfig,
+        enable_price_limit: bool = True,
+    ) -> None:
         self.config = config
+        self.price_limit_checker = PriceLimitChecker(enabled=enable_price_limit)
+        # 前收盘价缓存: symbol -> prev_close
+        self._prev_close: dict[str, float] = {}
+
+    def set_prev_close(self, symbol: str, prev_close: float) -> None:
+        """设置前收盘价（用于涨跌停校验）
+
+        Args:
+            symbol: 股票代码
+            prev_close: 前一交易日收盘价
+        """
+        self._prev_close[symbol] = prev_close
 
     def execute_order(
         self,
@@ -41,6 +214,7 @@ class SimulatedBroker:
         """执行订单
 
         根据A股规则计算成交价（含滑点）、佣金和印花税，更新订单状态。
+        新增涨跌停限制校验。
 
         Args:
             order: 待执行的订单
@@ -55,6 +229,22 @@ class SimulatedBroker:
                 "订单 %s 状态为 %s，无法执行", order.order_id, order.status
             )
             return order
+
+        # --- 涨跌停校验 ---
+        prev_close = self._prev_close.get(order.symbol)
+        if prev_close is not None and self.price_limit_checker.enabled:
+            if order.side == OrderSide.BUY:
+                can, reason = self.price_limit_checker.can_buy(
+                    order.symbol, current_price, prev_close
+                )
+            else:
+                can, reason = self.price_limit_checker.can_sell(
+                    order.symbol, current_price, prev_close
+                )
+            if not can:
+                order.status = OrderStatus.REJECTED
+                logger.info("订单 %s 因涨跌停被拒绝: %s", order.order_id, reason)
+                return order
 
         # 数量必须是lot_size的整数倍
         quantity = self._round_to_lot_size(order.quantity)

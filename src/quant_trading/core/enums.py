@@ -63,3 +63,14 @@ class StopLossMethod(str, Enum):
     FIXED_PERCENT = "fixed_percent"     # 固定百分比
     ATR_TRAILING = "atr_trailing"       # ATR跟踪止损
     SUPPORT_LEVEL = "support_level"     # 支撑位止损
+
+
+class AssetType(str, Enum):
+    """资产类型"""
+    STOCK = "stock"             # 个股
+    INDEX = "index"             # 指数
+    ETF = "etf"                 # ETF基金
+    FUND = "fund"               # 场外基金
+    BOND = "bond"               # 债券
+    FUTURES = "futures"         # 期货
+    OPTION = "option"           # 期权

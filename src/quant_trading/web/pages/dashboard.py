@@ -1,7 +1,7 @@
 """首页概览 - Dashboard
 
 展示大盘指数、持仓概览、组合净值曲线、最近交易、市场涨跌统计。
-所有数据使用模拟数据以确保可直接运行。
+优先尝试使用真实数据源，失败时自动回退到模拟数据。
 """
 
 from __future__ import annotations
@@ -12,14 +12,31 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from quant_trading.web.charts import equity_curve, pie_chart
+from quant_trading.web.charts import equity_curve, pie_chart, returns_distribution
 from quant_trading.web.components import (
     change_label,
     empty_state,
+    info_box,
     metric_card,
     sparkline,
     trade_table,
 )
+
+
+# ---------------------------------------------------------------------------
+# 数据获取（真实 -> 模拟回退）
+# ---------------------------------------------------------------------------
+
+def _try_fetch_realtime(code: str) -> dict | None:
+    """尝试从真实数据源获取实时行情"""
+    try:
+        from quant_trading.core.config import AppConfig
+        from quant_trading.data import DataManager
+        config = AppConfig()
+        dm = DataManager(config)
+        return dm.fetch_realtime(code)
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +218,32 @@ def render() -> None:
         )
         fig_pie.update_layout(height=400, margin=dict(l=10, r=10, t=10, b=10))
         st.plotly_chart(fig_pie, use_container_width=True)
+
+    # ====== 收益分布 ======
+    st.subheader("📊 收益分析")
+    col_dist, col_stats = st.columns([2, 1])
+
+    with col_dist:
+        daily_ret = strategy_eq.pct_change().dropna()
+        fig_dist = returns_distribution(daily_ret, title="日收益率分布")
+        st.plotly_chart(fig_dist, use_container_width=True)
+
+    with col_stats:
+        # 回测已有结果快速概览
+        backtest_results = st.session_state.backtest_results
+        if backtest_results:
+            st.markdown("**已完成回测**")
+            for name, res in backtest_results.items():
+                sv = res.get("summary_values", {})
+                tr = sv.get("total_return", 0)
+                sr = sv.get("sharpe", 0)
+                color = "🟢" if tr > 0 else "🔴"
+                st.markdown(f"{color} **{name}**: 收益 {tr:.2%} | 夏普 {sr:.4f}")
+        else:
+            info_box(
+                "快速开始",
+                "前往「策略回测」页面运行回测，结果将在此处汇总展示。",
+            )
 
     # ====== 市场涨跌统计 ======
     st.subheader("📊 市场涨跌统计")

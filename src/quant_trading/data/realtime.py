@@ -3,6 +3,7 @@
 提供:
 - RealtimeQuote: 实时行情Pydantic数据模型
 - RealtimeQuoteProvider: 实时行情数据提供者，支持单股/批量/市场快照/轮询订阅
+- RealtimeDataStream: 高级实时行情流，支持多股票轮询、多订阅回调、异步支持
 
 用法::
 
@@ -25,10 +26,23 @@
     provider.subscribe(["000001", "600519"], callback=on_quote, interval=3)
     # ... 稍后
     provider.unsubscribe()
+
+    # 高级数据流
+    import asyncio
+    from quant_trading.data.realtime import RealtimeDataStream
+
+    stream = RealtimeDataStream(provider)
+    stream.add_symbols(["000001", "600519"])
+    stream.on_quote(on_quote)
+    stream.start(interval=3)
+    # ... 异步用法
+    async for quote in stream.async_stream(["000001"], interval=3):
+        print(quote)
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 import time
@@ -558,3 +572,420 @@ class RealtimeQuoteProvider:
         """析构时自动取消订阅"""
         if self._is_subscribed:
             self.unsubscribe()
+
+
+# ======================================================================
+# 高级实时行情流
+# ======================================================================
+
+
+class RealtimeDataStream:
+    """高级实时行情数据流
+
+    在 RealtimeQuoteProvider 之上构建，提供:
+    - 多股票分组管理（动态添加/移除）
+    - 多回调订阅（按股票 / 全局）
+    - 行情变化检测（仅在价格变动时通知）
+    - 异步迭代器 (async for) 支持
+    - 行情快照缓存
+
+    Parameters
+    ----------
+    provider : RealtimeQuoteProvider | None
+        底层行情提供者。若为 None，自动创建一个 cache_ttl=1 的实例。
+
+    Examples
+    --------
+    >>> stream = RealtimeDataStream()
+    >>> stream.add_symbols(["000001", "600519"])
+    >>> stream.on_quote(lambda q: print(q.symbol, q.price))
+    >>> stream.start(interval=3)
+    >>> # ... later
+    >>> stream.stop()
+    """
+
+    def __init__(self, provider: RealtimeQuoteProvider | None = None) -> None:
+        self._provider = provider or RealtimeQuoteProvider(cache_ttl=1)
+
+        # 订阅的股票代码集合
+        self._symbols: set[str] = set()
+        self._symbols_lock = threading.Lock()
+
+        # 回调管理: 全局回调列表 + 按股票回调字典
+        self._global_callbacks: list[Callable[[RealtimeQuote], None]] = []
+        self._symbol_callbacks: dict[str, list[Callable[[RealtimeQuote], None]]] = {}
+        self._callbacks_lock = threading.Lock()
+
+        # 行情快照 (最新一次)
+        self._latest_quotes: dict[str, RealtimeQuote] = {}
+        self._quotes_lock = threading.Lock()
+
+        # 轮询控制
+        self._poll_thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+        self._is_running: bool = False
+
+        # 异步队列 (用于 async_stream)
+        self._async_queues: list[asyncio.Queue[RealtimeQuote | None]] = []
+        self._async_queues_lock = threading.Lock()
+
+        # 是否仅在变化时推送
+        self.only_on_change: bool = False
+
+        logger.debug("RealtimeDataStream 初始化完成")
+
+    # ------------------------------------------------------------------
+    # 股票管理
+    # ------------------------------------------------------------------
+
+    def add_symbols(self, symbols: list[str]) -> None:
+        """添加订阅股票
+
+        Parameters
+        ----------
+        symbols : list[str]
+            要添加的股票代码列表
+        """
+        with self._symbols_lock:
+            for s in symbols:
+                s = s.strip()
+                if s:
+                    self._symbols.add(s)
+        logger.debug("添加订阅股票: %s, 当前共 %d 只", symbols, len(self._symbols))
+
+    def remove_symbols(self, symbols: list[str]) -> None:
+        """移除订阅股票
+
+        Parameters
+        ----------
+        symbols : list[str]
+            要移除的股票代码列表
+        """
+        with self._symbols_lock:
+            for s in symbols:
+                self._symbols.discard(s.strip())
+        logger.debug("移除订阅股票: %s, 当前共 %d 只", symbols, len(self._symbols))
+
+    @property
+    def symbols(self) -> list[str]:
+        """当前订阅的股票代码列表"""
+        with self._symbols_lock:
+            return sorted(self._symbols)
+
+    # ------------------------------------------------------------------
+    # 回调管理
+    # ------------------------------------------------------------------
+
+    def on_quote(self, callback: Callable[[RealtimeQuote], None]) -> Callable:
+        """注册全局行情回调
+
+        每只股票的每次更新都会调用此回调。
+
+        Parameters
+        ----------
+        callback : Callable[[RealtimeQuote], None]
+            回调函数
+
+        Returns
+        -------
+        Callable
+            返回回调本身，便于装饰器用法
+        """
+        with self._callbacks_lock:
+            self._global_callbacks.append(callback)
+        return callback
+
+    def on_symbol_quote(
+        self,
+        symbol: str,
+        callback: Callable[[RealtimeQuote], None],
+    ) -> Callable:
+        """注册指定股票的行情回调
+
+        Parameters
+        ----------
+        symbol : str
+            股票代码
+        callback : Callable[[RealtimeQuote], None]
+            回调函数
+
+        Returns
+        -------
+        Callable
+            返回回调本身
+        """
+        symbol = symbol.strip()
+        with self._callbacks_lock:
+            if symbol not in self._symbol_callbacks:
+                self._symbol_callbacks[symbol] = []
+            self._symbol_callbacks[symbol].append(callback)
+        # 自动加入订阅
+        self.add_symbols([symbol])
+        return callback
+
+    def remove_callback(self, callback: Callable) -> bool:
+        """移除指定回调（全局或按股票）
+
+        Parameters
+        ----------
+        callback : Callable
+            要移除的回调
+
+        Returns
+        -------
+        bool
+            是否成功移除
+        """
+        removed = False
+        with self._callbacks_lock:
+            if callback in self._global_callbacks:
+                self._global_callbacks.remove(callback)
+                removed = True
+            for sym_cbs in self._symbol_callbacks.values():
+                if callback in sym_cbs:
+                    sym_cbs.remove(callback)
+                    removed = True
+        return removed
+
+    # ------------------------------------------------------------------
+    # 行情快照
+    # ------------------------------------------------------------------
+
+    def get_latest_quote(self, symbol: str) -> RealtimeQuote | None:
+        """获取指定股票最新一次行情快照
+
+        Parameters
+        ----------
+        symbol : str
+            股票代码
+
+        Returns
+        -------
+        RealtimeQuote | None
+            最新行情，如果尚无数据则返回 None
+        """
+        with self._quotes_lock:
+            return self._latest_quotes.get(symbol.strip())
+
+    def get_all_latest_quotes(self) -> dict[str, RealtimeQuote]:
+        """获取所有订阅股票的最新行情快照
+
+        Returns
+        -------
+        dict[str, RealtimeQuote]
+            股票代码 -> 行情数据 的字典
+        """
+        with self._quotes_lock:
+            return dict(self._latest_quotes)
+
+    # ------------------------------------------------------------------
+    # 内部：派发行情
+    # ------------------------------------------------------------------
+
+    def _dispatch_quote(self, quote: RealtimeQuote) -> None:
+        """派发行情到所有注册的回调和异步队列"""
+        # 变化检测
+        if self.only_on_change:
+            with self._quotes_lock:
+                prev = self._latest_quotes.get(quote.symbol)
+                if prev is not None and prev.price == quote.price:
+                    return
+
+        # 更新快照
+        with self._quotes_lock:
+            self._latest_quotes[quote.symbol] = quote
+
+        # 全局回调
+        with self._callbacks_lock:
+            global_cbs = list(self._global_callbacks)
+            symbol_cbs = list(self._symbol_callbacks.get(quote.symbol, []))
+
+        for cb in global_cbs:
+            try:
+                cb(quote)
+            except Exception as exc:
+                logger.error("全局回调异常: %s", exc)
+
+        for cb in symbol_cbs:
+            try:
+                cb(quote)
+            except Exception as exc:
+                logger.error("股票 %s 回调异常: %s", quote.symbol, exc)
+
+        # 异步队列推送
+        with self._async_queues_lock:
+            for q in self._async_queues:
+                try:
+                    q.put_nowait(quote)
+                except asyncio.QueueFull:
+                    logger.warning("异步队列已满，丢弃行情: %s", quote.symbol)
+
+    # ------------------------------------------------------------------
+    # 轮询控制
+    # ------------------------------------------------------------------
+
+    def _poll_loop(self, interval: float) -> None:
+        """后台轮询循环"""
+        logger.info("RealtimeDataStream 轮询开始, interval=%.1fs", interval)
+        while not self._stop_event.is_set():
+            with self._symbols_lock:
+                current_symbols = list(self._symbols)
+
+            if current_symbols:
+                try:
+                    quotes = self._provider.get_realtime_quotes(current_symbols)
+                    for quote in quotes:
+                        self._dispatch_quote(quote)
+                except Exception as exc:
+                    logger.error("轮询获取行情失败: %s", exc)
+
+            self._stop_event.wait(timeout=interval)
+
+        logger.info("RealtimeDataStream 轮询已停止")
+
+    def start(self, interval: float = 3.0) -> None:
+        """启动后台轮询
+
+        Parameters
+        ----------
+        interval : float
+            轮询间隔（秒）。建议 >= 3 以避免触发限流。
+
+        Raises
+        ------
+        RuntimeError
+            已经在运行中
+        """
+        if self._is_running:
+            raise RuntimeError("RealtimeDataStream 已在运行中")
+
+        if not self._symbols:
+            raise ValueError("没有订阅任何股票，请先调用 add_symbols()")
+
+        self._stop_event.clear()
+        self._is_running = True
+
+        self._poll_thread = threading.Thread(
+            target=self._poll_loop,
+            args=(interval,),
+            daemon=True,
+            name="realtime-data-stream",
+        )
+        self._poll_thread.start()
+
+    def stop(self) -> None:
+        """停止后台轮询"""
+        if not self._is_running:
+            logger.debug("RealtimeDataStream 未在运行")
+            return
+
+        self._stop_event.set()
+        if self._poll_thread is not None:
+            self._poll_thread.join(timeout=10)
+            if self._poll_thread.is_alive():
+                logger.warning("轮询线程未能在 10 秒内停止")
+            self._poll_thread = None
+
+        self._is_running = False
+
+        # 通知所有异步队列结束
+        with self._async_queues_lock:
+            for q in self._async_queues:
+                try:
+                    q.put_nowait(None)
+                except asyncio.QueueFull:
+                    pass
+
+        logger.info("RealtimeDataStream 已停止")
+
+    @property
+    def is_running(self) -> bool:
+        """是否正在运行"""
+        return self._is_running
+
+    # ------------------------------------------------------------------
+    # 异步支持
+    # ------------------------------------------------------------------
+
+    async def async_stream(
+        self,
+        symbols: list[str] | None = None,
+        interval: float = 3.0,
+        max_queue_size: int = 1000,
+    ):
+        """异步行情流迭代器
+
+        可以通过 ``async for`` 获取实时行情。如果轮询尚未启动，
+        会自动启动后台轮询。
+
+        Parameters
+        ----------
+        symbols : list[str] | None
+            额外要订阅的股票代码。如已通过 add_symbols 添加，可省略。
+        interval : float
+            轮询间隔（秒）
+        max_queue_size : int
+            异步队列最大长度
+
+        Yields
+        ------
+        RealtimeQuote
+            实时行情数据
+        """
+        if symbols:
+            self.add_symbols(symbols)
+
+        queue: asyncio.Queue[RealtimeQuote | None] = asyncio.Queue(
+            maxsize=max_queue_size
+        )
+
+        with self._async_queues_lock:
+            self._async_queues.append(queue)
+
+        # 自动启动轮询
+        if not self._is_running:
+            self.start(interval=interval)
+
+        try:
+            while True:
+                quote = await queue.get()
+                if quote is None:
+                    break
+                yield quote
+        finally:
+            with self._async_queues_lock:
+                if queue in self._async_queues:
+                    self._async_queues.remove(queue)
+
+    async def async_get_quotes(self, symbols: list[str]) -> list[RealtimeQuote]:
+        """异步获取一次性行情（在线程池中执行同步调用）
+
+        Parameters
+        ----------
+        symbols : list[str]
+            股票代码列表
+
+        Returns
+        -------
+        list[RealtimeQuote]
+            行情数据列表
+        """
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None, self._provider.get_realtime_quotes, symbols
+        )
+
+    # ------------------------------------------------------------------
+    # 魔术方法
+    # ------------------------------------------------------------------
+
+    def __repr__(self) -> str:
+        return (
+            f"RealtimeDataStream(symbols={len(self._symbols)}, "
+            f"callbacks={len(self._global_callbacks)}, "
+            f"running={self._is_running})"
+        )
+
+    def __del__(self) -> None:
+        if self._is_running:
+            self.stop()

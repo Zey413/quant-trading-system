@@ -36,7 +36,7 @@ from quant_trading.data.export import DataExporter
 from quant_trading.data.financial import FinancialDataProvider
 from quant_trading.data.manager import DataManager
 from quant_trading.data.rate_limiter import RateLimiter, rate_limited
-from quant_trading.data.realtime import RealtimeQuote, RealtimeQuoteProvider
+from quant_trading.data.realtime import RealtimeQuote, RealtimeQuoteProvider, RealtimeDataStream
 
 # 导入具体数据源，触发 @DataSourceRegistry.register() 装饰器注册
 import quant_trading.data.akshare_source as _akshare_source  # noqa: F401
@@ -49,6 +49,7 @@ __all__ = [
     "DataManager",
     "RealtimeQuote",
     "RealtimeQuoteProvider",
+    "RealtimeDataStream",
     "FinancialDataProvider",
     "DataCache",
     "cached",
