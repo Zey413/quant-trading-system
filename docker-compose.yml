@@ -1,0 +1,59 @@
+# ============================================================
+# 量化交易系统 Docker Compose 配置
+# ============================================================
+#
+# 使用方式:
+#   docker-compose up -d              # 启动服务
+#   docker-compose exec quant bash    # 进入容器
+#   docker-compose exec quant quant fetch -s 000001  # 执行命令
+#   docker-compose down               # 停止服务
+#
+
+services:
+  quant:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: quant-trading:latest
+    container_name: quant-trading
+
+    # 保持容器运行（默认 sleep，随时可 exec 执行命令）
+    entrypoint: ["tail", "-f", "/dev/null"]
+
+    # 数据卷挂载
+    volumes:
+      # 配置文件（宿主机可编辑，容器实时生效）
+      - ./config:/app/config:ro
+      # 数据缓存（持久化，避免重复下载）
+      - quant_data_cache:/app/data_cache
+      # 回测输出（图表、报告）
+      - ./output:/app/output
+      # 报告目录
+      - ./reports:/app/reports
+      # 日志
+      - ./logs:/app/logs
+
+    # 环境变量
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TZ=Asia/Shanghai
+      # 如使用 Tushare，在此设置 Token（也可在 config/default.yaml 中配置）
+      # - TUSHARE_TOKEN=your_token_here
+
+    # 资源限制
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "2.0"
+        reservations:
+          memory: 512M
+          cpus: "0.5"
+
+    # 重启策略
+    restart: unless-stopped
+
+# 命名卷（持久化数据缓存）
+volumes:
+  quant_data_cache:
+    driver: local
