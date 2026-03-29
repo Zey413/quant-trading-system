@@ -14,6 +14,8 @@ import logging
 import uuid
 from datetime import date
 
+import pandas as pd
+
 from quant_trading.core.enums import OrderSide, OrderStatus
 from quant_trading.core.models import Order, Portfolio, Position, TradeRecord
 
@@ -45,6 +47,8 @@ class PortfolioManager:
         # 记录当日买入的数量，key为symbol，value为当日买入的股数
         # 在new_trading_day()时将这些数量转入available_quantity
         self._pending_available: dict[str, int] = {}
+        # 组合历史记录，用于后续分析
+        self._history: list[dict] = []
 
     def process_buy(self, order: Order) -> None:
         """处理买入成交
@@ -240,3 +244,49 @@ class PortfolioManager:
             "positions": positions_info,
             "return_pct": round(self.portfolio.total_return, 4),
         }
+
+    def record_history(self, date: date, prices: dict[str, float]) -> None:
+        """记录当前组合状态到历史，供后续分析使用。
+
+        每个交易日更新价格之后调用一次，将当日快照追加到 ``_history`` 列表。
+
+        Args:
+            date: 当前交易日期
+            prices: {symbol: current_price} 当日收盘价字典
+        """
+        # 确保价格已更新
+        self.update_prices(prices)
+
+        cash = self.portfolio.cash
+        market_value = self.portfolio.market_value
+        total_value = self.portfolio.total_value
+        initial = self.portfolio.initial_capital
+        return_pct = (total_value - initial) / initial if initial > 0 else 0.0
+
+        self._history.append(
+            {
+                "date": date,
+                "cash": round(cash, 2),
+                "market_value": round(market_value, 2),
+                "total_value": round(total_value, 2),
+                "return_pct": round(return_pct, 6),
+            }
+        )
+
+    @property
+    def history_df(self) -> pd.DataFrame:
+        """将组合历史记录转换为 DataFrame 返回。
+
+        Returns:
+            包含以下列的 DataFrame:
+                - date: 交易日期
+                - cash: 当日现金
+                - market_value: 当日持仓市值
+                - total_value: 当日总资产
+                - return_pct: 累计收益率
+        """
+        if not self._history:
+            return pd.DataFrame(
+                columns=["date", "cash", "market_value", "total_value", "return_pct"]
+            )
+        return pd.DataFrame(self._history)

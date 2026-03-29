@@ -65,8 +65,8 @@ class MACrossoverStrategy(Strategy):
         above = short_ma > long_ma
         below_or_equal = short_ma <= long_ma
         # 前一 bar 的关系
-        prev_above = above.shift(1).fillna(False)
-        prev_below_or_equal = below_or_equal.shift(1).fillna(True)
+        prev_above = above.shift(1, fill_value=False)
+        prev_below_or_equal = below_or_equal.shift(1, fill_value=True)
 
         # 金叉：前一 bar 短 <= 长，当前 bar 短 > 长
         golden_cross = prev_below_or_equal & above

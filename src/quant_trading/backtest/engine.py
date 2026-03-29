@@ -32,18 +32,22 @@ logger = logging.getLogger(__name__)
 
 
 class Strategy(Protocol):
-    """策略协议 - 任何策略需要实现此接口"""
+    """策略协议 - 任何策略需要实现此接口
 
-    def on_bar(self, date: date, row: pd.Series, portfolio_snapshot: dict) -> Signal | None:
-        """根据当日行情数据生成交易信号
+    推荐实现 ``generate_signals(data)`` 方法，该方法接收 DataFrame 并返回
+    添加了 ``signal`` 列的 DataFrame（值为 "buy"/"sell"/"hold"）。
+
+    为向后兼容也支持 ``on_bar(date, row, snapshot)`` 逐日接口。
+    """
+
+    def generate_signals(self, data: pd.DataFrame) -> pd.DataFrame:
+        """批量生成交易信号
 
         Args:
-            date: 当前交易日
-            row: 当日行情数据（包含open, high, low, close, volume等）
-            portfolio_snapshot: 当前组合快照
+            data: 行情数据 DataFrame（至少包含 OHLCV 列）
 
         Returns:
-            交易信号或None（无信号）
+            添加了 ``signal`` 列的 DataFrame
         """
         ...
 
@@ -119,7 +123,7 @@ class BacktestEngine:
         self._init_risk_manager()
 
         # 如果策略有 generate_signals 方法，先预计算信号
-        if hasattr(strategy, "generate_signals") and not hasattr(strategy, "on_bar"):
+        if hasattr(strategy, "generate_signals"):
             data = strategy.generate_signals(data.copy())
 
         # 准备数据
@@ -309,20 +313,16 @@ class BacktestEngine:
     ) -> None:
         """处理策略信号
 
-        兼容两种策略接口:
-        1. on_bar(date, row, snapshot) -> Signal | None (Protocol方式)
-        2. 预计算的 signal 列 (generate_signals方式)
+        兼容两种策略接口（按优先级）:
+        1. 预计算的 signal 列 (generate_signals方式，优先)
+        2. on_bar(date, row, snapshot) -> Signal | None (向后兼容)
 
         获取信号 -> 风险验证 -> 创建订单 -> 验证订单 -> 执行订单 -> 更新组合
         """
         signal = None
 
-        # 方式1: 如果策略有 on_bar 方法
-        if hasattr(strategy, "on_bar"):
-            snapshot = self.portfolio_manager.get_snapshot()
-            signal = strategy.on_bar(current_date, row, snapshot)
-        # 方式2: 如果行数据中有预计算的 signal 列
-        elif "signal" in row.index:
+        # 方式1: 如果行数据中有预计算的 signal 列（from generate_signals）
+        if "signal" in row.index:
             sig_type = row["signal"]
             if sig_type in ("buy", "sell"):
                 signal = Signal(
@@ -331,6 +331,10 @@ class BacktestEngine:
                     signal_type=sig_type,
                     price=current_price,
                 )
+        # 方式2: 如果策略有 on_bar 方法（向后兼容）
+        elif hasattr(strategy, "on_bar"):
+            snapshot = self.portfolio_manager.get_snapshot()
+            signal = strategy.on_bar(current_date, row, snapshot)
 
         if signal is None or signal.signal_type == "hold":
             return
