@@ -34,6 +34,8 @@ dependencies = [
     "pyarrow>=12.0.0",
     "akshare>=1.10.0",
     "tushare>=1.4.0",
+    "streamlit>=1.30.0",
+    "plotly>=5.18.0",
 ]
 
 [project.optional-dependencies]
@@ -44,6 +46,7 @@ dev = [
 
 [project.scripts]
 quant = "quant_trading.cli.main:cli"
+quant-web = "quant_trading.web.app:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
