@@ -1,0 +1,31 @@
+# 量化交易系统默认配置
+
+data_source:
+  default_source: "akshare"     # 默认数据源: akshare / tushare
+  tushare_token: ""             # Tushare Pro API Token (需自行申请)
+  cache_dir: "data_cache"       # 数据缓存目录
+  cache_enabled: true           # 是否启用Parquet缓存
+
+broker:
+  commission_rate: 0.0003       # 佣金率 万三
+  min_commission: 5.0           # 最低佣金 5元
+  stamp_tax_rate: 0.001         # 印花税 千一 (仅卖出)
+  slippage: 0.001               # 滑点 千一
+  lot_size: 100                 # 最小交易单位 100股(1手)
+  trading_days_per_year: 244    # 年交易日数
+  t_plus_1: true                # T+1交易规则
+
+backtest:
+  initial_capital: 1000000.0    # 初始资金 100万
+  start_date: "2023-01-01"      # 回测开始日期
+  end_date: "2025-12-31"        # 回测结束日期
+  benchmark: "000300"           # 基准指数 沪深300
+  risk_free_rate: 0.025         # 无风险利率 2.5%
+
+risk:
+  max_position_pct: 0.3         # 单只股票最大仓位 30%
+  max_total_position_pct: 0.8   # 总仓位上限 80%
+  stop_loss_pct: 0.05           # 止损线 5%
+  take_profit_pct: 0.15         # 止盈线 15%
+  position_sizing_method: "fixed_ratio"  # 仓位管理: fixed_ratio / kelly / atr_based
+  fixed_ratio: 0.1              # 固定比例 10%
